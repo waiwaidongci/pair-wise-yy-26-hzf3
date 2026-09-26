@@ -141,6 +141,37 @@ class VulnerabilityDB:
               created_at TEXT NOT NULL,
               published_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS review_rounds (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','superseded')),
+              note TEXT NOT NULL DEFAULT '',
+              created_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              closed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS review_assignees (
+              round_id INTEGER NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+              user_id INTEGER NOT NULL REFERENCES users(id),
+              PRIMARY KEY(round_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS review_votes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              round_id INTEGER NOT NULL REFERENCES review_rounds(id) ON DELETE CASCADE,
+              user_id INTEGER NOT NULL REFERENCES users(id),
+              decision TEXT NOT NULL CHECK(decision IN ('approve','object')),
+              comment TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS version_corrections (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              version_key TEXT NOT NULL,
+              action TEXT NOT NULL CHECK(action IN ('add','remove')),
+              reason TEXT NOT NULL,
+              changed_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -305,6 +336,11 @@ class VulnerabilityDB:
         payload["fix_plan"] = dict(self.conn.execute("SELECT * FROM fix_plans WHERE report_id=?", (report_id,)).fetchone() or {})
         payload["history"] = [dict(r) for r in self.conn.execute("SELECT * FROM status_history WHERE report_id=? ORDER BY id", (report_id,))]
         payload["extensions"] = [dict(r) for r in self.conn.execute("SELECT * FROM extensions WHERE report_id=? ORDER BY id", (report_id,))]
+        payload["reviews"] = self.review_status(report_id)
+        payload["version_corrections"] = [dict(r) for r in self.conn.execute(
+            "SELECT c.*,u.name AS changed_by_name FROM version_corrections c JOIN users u ON u.id=c.changed_by WHERE c.report_id=? ORDER BY c.id",
+            (report_id,),
+        )]
         return payload
 
     def set_status(self, report_id: int, new_status: str, user_id: int, note: str = "") -> None:
@@ -316,6 +352,8 @@ class VulnerabilityDB:
             raise DomainError("报告人不能推进协调状态")
         if new_status not in STATUS_TRANSITIONS.get(report["status"], set()):
             raise DomainError(f"状态不能从 {report['status']} 变为 {new_status}")
+        if new_status == "published":
+            self._ensure_review_passed(report_id)
         now = datetime.now().isoformat()
         with self.transaction():
             self.conn.execute("UPDATE reports SET status=?,updated_at=? WHERE id=?", (new_status, now, report_id))
@@ -410,6 +448,170 @@ class VulnerabilityDB:
                 draft_id = int(cur.lastrowid)
         return int(draft_id)
 
+    def start_review(self, report_id: int, coordinator_id: int, assignee_ids: list[int], note: str = "") -> int:
+        actor = self._user(coordinator_id)
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report or actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以发起披露前评审")
+        if report["status"] != "resolved":
+            raise DomainError("只有已解决报告可以发起披露前评审")
+        unique_ids: list[int] = []
+        for uid in assignee_ids:
+            uid = int(uid)
+            if uid not in unique_ids:
+                unique_ids.append(uid)
+        if not unique_ids:
+            raise DomainError("必须指定至少一名需要表态的评审人")
+        for uid in unique_ids:
+            if not self.can_view(report_id, uid):
+                raise DomainError(f"评审人 {uid} 不在该报告的协作范围内")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE review_rounds SET status='superseded',closed_at=? WHERE report_id=? AND status='open'",
+                (now, report_id),
+            )
+            cur = self.conn.execute(
+                "INSERT INTO review_rounds(report_id,note,created_by,created_at) VALUES(?,?,?,?)",
+                (report_id, note.strip(), coordinator_id, now),
+            )
+            round_id = int(cur.lastrowid)
+            for uid in unique_ids:
+                self.conn.execute("INSERT INTO review_assignees(round_id,user_id) VALUES(?,?)", (round_id, uid))
+                self._notify(report_id, uid, "review", f"请对漏洞 {report['public_id']} 的披露进行评审表态")
+        return round_id
+
+    def review_vote(self, round_id: int, user_id: int, decision: str, comment: str = "") -> int:
+        review_round = self.conn.execute("SELECT * FROM review_rounds WHERE id=?", (round_id,)).fetchone()
+        if not review_round:
+            raise DomainError("评审批次不存在")
+        if review_round["status"] != "open":
+            raise DomainError("该评审批次已关闭，请等待新的评审")
+        if decision not in {"approve", "object"}:
+            raise DomainError("表态必须是赞同或反对")
+        self._user(user_id)
+        if not self.conn.execute("SELECT 1 FROM review_assignees WHERE round_id=? AND user_id=?", (round_id, user_id)).fetchone():
+            raise DomainError("只有被指定的评审人可以表态")
+        if decision == "object" and len(comment.strip()) < 5:
+            raise DomainError("反对意见需要说明理由（至少5个字符）")
+        report_id = review_round["report_id"]
+        now = datetime.now().isoformat()
+        with self.transaction():
+            cur = self.conn.execute(
+                "INSERT INTO review_votes(round_id,user_id,decision,comment,created_at) VALUES(?,?,?,?,?)",
+                (round_id, user_id, decision, comment.strip(), now),
+            )
+            label = "赞同" if decision == "approve" else "反对"
+            message = f"评审表态：{label}" + (f"（{comment.strip()}）" if comment.strip() else "")
+            self._notify(report_id, review_round["created_by"], "review_vote", message)
+            for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
+                self._notify(report_id, member["user_id"], "review_vote", message)
+        return int(cur.lastrowid)
+
+    def _round_summary(self, review_round: sqlite3.Row) -> dict:
+        round_id = review_round["id"]
+        assignees = [dict(r) for r in self.conn.execute(
+            "SELECT a.user_id,u.name,u.role FROM review_assignees a JOIN users u ON u.id=a.user_id WHERE a.round_id=? ORDER BY a.user_id",
+            (round_id,),
+        )]
+        votes = [dict(r) for r in self.conn.execute(
+            "SELECT v.*,u.name FROM review_votes v JOIN users u ON u.id=v.user_id WHERE v.round_id=? ORDER BY v.id",
+            (round_id,),
+        )]
+        latest: dict[int, dict] = {}
+        for vote in votes:
+            latest[vote["user_id"]] = vote
+        pending = [a for a in assignees if a["user_id"] not in latest]
+        objections = [latest[a["user_id"]] for a in assignees
+                      if a["user_id"] in latest and latest[a["user_id"]]["decision"] == "object"]
+        if review_round["status"] != "open":
+            conclusion = "superseded"
+        elif objections:
+            conclusion = "blocked"
+        elif pending:
+            conclusion = "pending"
+        else:
+            conclusion = "approved"
+        return {
+            **dict(review_round),
+            "assignees": assignees,
+            "votes": votes,
+            "pending": pending,
+            "objections": objections,
+            "conclusion": conclusion,
+        }
+
+    def review_status(self, report_id: int) -> list[dict]:
+        rounds = self.conn.execute("SELECT * FROM review_rounds WHERE report_id=? ORDER BY id", (report_id,)).fetchall()
+        return [self._round_summary(r) for r in rounds]
+
+    def _active_round(self, report_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM review_rounds WHERE report_id=? AND status='open' ORDER BY id DESC", (report_id,)
+        ).fetchone()
+
+    def _ensure_review_passed(self, report_id: int) -> None:
+        review_round = self._active_round(report_id)
+        if not review_round:
+            raise DomainError("披露前必须由协调员发起评审并达成一致")
+        summary = self._round_summary(review_round)
+        if summary["objections"]:
+            names = "、".join(v["name"] for v in summary["objections"])
+            raise DomainError(f"存在未处理的反对意见（{names}），披露已暂停")
+        if summary["pending"]:
+            names = "、".join(a["name"] for a in summary["pending"])
+            raise DomainError(f"评审尚未完成，{names} 未表态")
+
+    def correct_versions(self, report_id: int, user_id: int, add: list[str] | None = None,
+                         remove: list[str] | None = None, reason: str = "") -> int:
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        if report["status"] == "published":
+            raise DomainError("已披露报告不能更正版本")
+        user = self._user(user_id)
+        if not (user["role"] == "coordinator" or self._member(report_id, user_id) or user_id == report["reporter_id"]):
+            raise DomainError("无权更正该报告的版本")
+        add = [str(v).strip() for v in (add or []) if str(v).strip()]
+        remove = [str(v).strip() for v in (remove or []) if str(v).strip()]
+        if not add and not remove:
+            raise DomainError("没有需要更正的版本")
+        if len(reason.strip()) < 5:
+            raise DomainError("版本更正需要填写原因（至少5个字符）")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            changes = 0
+            for version in add:
+                cur = self.conn.execute(
+                    "INSERT OR IGNORE INTO affected_versions(report_id,version_key,details) VALUES(?,?,?)",
+                    (report_id, version, reason.strip()),
+                )
+                if cur.rowcount:
+                    self.conn.execute(
+                        "INSERT INTO version_corrections(report_id,version_key,action,reason,changed_by,created_at) VALUES(?,?,?,?,?,?)",
+                        (report_id, version, "add", reason.strip(), user_id, now),
+                    )
+                    changes += 1
+            for version in remove:
+                cur = self.conn.execute(
+                    "DELETE FROM affected_versions WHERE report_id=? AND version_key=?", (report_id, version)
+                )
+                if cur.rowcount:
+                    self.conn.execute(
+                        "INSERT INTO version_corrections(report_id,version_key,action,reason,changed_by,created_at) VALUES(?,?,?,?,?,?)",
+                        (report_id, version, "remove", reason.strip(), user_id, now),
+                    )
+                    changes += 1
+            if not changes:
+                raise DomainError("版本没有实际变化")
+            remaining = self.conn.execute("SELECT COUNT(*) FROM affected_versions WHERE report_id=?", (report_id,)).fetchone()[0]
+            if remaining < 1:
+                raise DomainError("至少保留一个受影响版本")
+            self.conn.execute("UPDATE reports SET updated_at=? WHERE id=?", (now, report_id))
+            for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
+                self._notify(report_id, member["user_id"], "version", f"受影响版本已更正：{reason.strip()}")
+        return changes
+
     def _publish_advisory_if_ready(self, report_id: int, user_id: int, when: str) -> None:
         draft = self.conn.execute("SELECT * FROM advisory_drafts WHERE report_id=?", (report_id,)).fetchone()
         if not draft:
@@ -436,6 +638,7 @@ class VulnerabilityDB:
             raise DomainError(f"保密期截至 {report['confidential_until']}，不能提前披露")
         if report["status"] != "resolved":
             raise DomainError("只有已解决报告可以披露")
+        self._ensure_review_passed(report_id)
         self.set_status(report_id, "published", coordinator_id, f"公开日期 {when}")
 
     def get_advisory(self, report_id: int, user_id: int) -> dict:
